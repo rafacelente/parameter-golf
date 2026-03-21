@@ -1,3 +1,14 @@
+[build-system]
+requires = ["setuptools>=82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["parameter_golf*"]
+
+[tool.uv]
+config-settings = { editable_mode = "compat" }
+
 [project]
 name = "parameter-golf"
 version = "0.1.0"

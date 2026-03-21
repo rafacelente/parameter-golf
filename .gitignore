@@ -10,3 +10,6 @@ data/docs_selected.jsonl
 .venv
 logs/
 uv.lock
+final_model.int8.ptz
+final_model.pt
+parameter_golf.egg-info/
