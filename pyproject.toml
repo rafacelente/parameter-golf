@@ -20,10 +20,13 @@ dependencies = [
     "huggingface-hub>=1.7.2",
     "kernels>=0.12.3",
     "numpy>=2.4.3",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
     "sentencepiece>=0.2.1",
     "setuptools>=82.0.1",
     "tiktoken>=0.12.0",
     "torch>=2.10.0",
     "tqdm>=4.67.3",
     "typing-extensions==4.15.0",
+    "wandb",
 ]

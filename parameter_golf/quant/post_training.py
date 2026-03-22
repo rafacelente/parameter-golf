@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 from torch import Tensor
 from .common import (
@@ -7,6 +9,7 @@ from .common import (
     INT8_KEEP_FLOAT_STORE_DTYPE,
     INT8_PER_ROW_SCALE_DTYPE,
 )
+from .bitnet import quantize_weights_to_int8 as _bitnet_quantize
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -40,12 +43,10 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
+def quantize_state_dict_int8(
+    state_dict: dict[str, Tensor],
+    bitlinear_weight_names: set[str] | None = None,
+):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -56,6 +57,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    _bl_names = bitlinear_weight_names or set()
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -67,6 +69,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # BitLinear weights use native ternary quantization ({-1,0,+1} + per-tensor scale)
+        # instead of the generic per-row int8 scheme.
+        if name in _bl_names:
+            stats["num_float_tensors"] += 1
+            q, s = _bitnet_quantize(t)
+            qmeta[name] = {"scheme": "ternary"}
+            quantized[name] = q
+            scales[name] = s.to(dtype=torch.float32).contiguous()
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(scales[name])
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -106,15 +120,20 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        scheme = qmeta.get(name, {}).get("scheme")
+
+        if scheme == "ternary":
+            # Ternary BitLinear: q ∈ {-1,0,+1} as int8, s is per-tensor scale.
+            # Dequantize: w = q / s  (since quantize stored scale = 1/mean(|w|))
+            out[name] = (q.float() / s.float()).to(dtype=dtype).contiguous()
+        elif scheme == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):

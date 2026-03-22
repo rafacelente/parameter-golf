@@ -20,6 +20,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attn_bitlinear_layers: set[int] | None = None,
+        mlp_bitlinear_layers: set[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -32,6 +34,8 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        _attn_bl = attn_bitlinear_layers or set()
+        _mlp_bl = mlp_bitlinear_layers or set()
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -41,6 +45,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attn_bitlinear=(i in _attn_bl),
+                    mlp_bitlinear=(i in _mlp_bl),
                 )
                 for i in range(num_layers)
             ]

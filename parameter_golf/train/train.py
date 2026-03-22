@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -17,8 +18,10 @@ import zlib
 import sentencepiece as spm
 
 from parameter_golf.common.hp import Hyperparameters
+from parameter_golf.common.tracking import save_hparams
 from parameter_golf.model import GPT
 from parameter_golf.modules.linear import CastedLinear
+from parameter_golf.modules.bitlinear import BitLinear, set_bitlinear_eval_quantized
 from parameter_golf.modules.utils import restore_low_dim_params_to_fp32
 from parameter_golf.quant.post_training import quantize_state_dict_int8, dequantize_state_dict_int8
 from parameter_golf.quant.common import CONTROL_TENSOR_NAME_PATTERNS
@@ -27,9 +30,22 @@ from parameter_golf.eval import eval_val
 from parameter_golf.optimizers import muon as muon_module
 from parameter_golf.optimizers.muon import Muon
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=None, help="Path to a YAML config file")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="parameter-golf", help="wandb project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="wandb entity (team or user)")
+    parser.add_argument("--profile", action="store_true", help="Run a short profiling pass and export Chrome trace JSON")
+    parser.add_argument("--profile-steps", type=int, default=5, help="Number of steps to profile (after warmup)")
+    return parser.parse_args()
+
+
 def main() -> None:
+    cli = parse_args()
     code = Path(__file__).read_text(encoding="utf-8")
-    args = Hyperparameters()
+    args = Hyperparameters.from_yaml(cli.config)
     muon_module.zeropower_via_newtonschulz5 = torch.compile(muon_module.zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -65,11 +81,25 @@ def main() -> None:
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
+    log_dir = Path(f"logs/{args.run_id}")
+    use_wandb = cli.wandb and not cli.profile and master_process
     logfile = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
-        print(logfile)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logfile = str(log_dir / "train.log")
+        hp_path = save_hparams(args, log_dir)
+        print(f"log_dir: {log_dir}")
+        print(f"hparams: {hp_path}")
+
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=cli.wandb_project,
+            entity=cli.wandb_entity,
+            name=args.run_id,
+            config=args.model_dump(mode="json"),
+            dir=str(log_dir),
+        )
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -120,6 +150,11 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    bl_layer_set = set(args.bitlinear_layers) if args.bitlinear_layers is not None else set(range(args.num_layers))
+    attn_bl_layers = bl_layer_set if args.use_bitlinear and args.attention_bitlinear else None
+    mlp_bl_layers = bl_layer_set if args.use_bitlinear and args.mlp_bitlinear else None
+    any_bitlinear = attn_bl_layers is not None or mlp_bl_layers is not None
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -132,9 +167,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attn_bitlinear_layers=attn_bl_layers,
+        mlp_bitlinear_layers=mlp_bl_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, BitLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -191,6 +228,8 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if any_bitlinear:
+        log0(f"bitlinear: attn_layers={sorted(attn_bl_layers) if attn_bl_layers else []} mlp_layers={sorted(mlp_bl_layers) if mlp_bl_layers else []}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -258,6 +297,44 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
+    # PROFILING (optional, exits early)
+    # -----------------------------
+
+    if cli.profile and master_process:
+        from torch.profiler import profile as torch_profile, ProfilerActivity, schedule as prof_schedule
+        prof_wait, prof_warmup, prof_active = 1, 2, cli.profile_steps
+        prof_total = prof_wait + prof_warmup + prof_active
+        trace_path = str(log_dir / "trace.json")
+        log0(f"profiling: {prof_total} steps (wait={prof_wait} warmup={prof_warmup} active={prof_active})")
+        model.train()
+        with torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=prof_schedule(wait=prof_wait, warmup=prof_warmup, active=prof_active, repeat=1),
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_path),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            for prof_step in range(prof_total):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss = model(x, y)
+                    (loss * grad_scale).backward()
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+                prof.step()
+        log0(f"trace exported: {trace_path}")
+        log0("open in chrome://tracing or https://ui.perfetto.dev")
+        if distributed:
+            dist.destroy_process_group()
+        return
+
+    # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
 
@@ -290,6 +367,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if use_wandb:
+                wandb.log({"val_loss": val_loss, "val_bpb": val_bpb}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -339,8 +418,15 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"lr scale:{scale}"
             )
+            if use_wandb:
+                wandb.log({
+                    "train_loss": train_loss.item(),
+                    "train_time_ms": approx_training_time_ms,
+                    "step_avg_ms": approx_training_time_ms / step,
+                }, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -370,7 +456,14 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    bitlinear_weight_names: set[str] | None = None
+    if any_bitlinear:
+        bitlinear_weight_names = {
+            f"{mod_name}.weight" if mod_name else "weight"
+            for mod_name, module in base_model.named_modules()
+            if isinstance(module, BitLinear)
+        }
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bitlinear_weight_names)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -394,11 +487,14 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if any_bitlinear:
+        set_bitlinear_eval_quantized(base_model)
+    roundtrip_model: nn.Module = base_model if any_bitlinear else model
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        roundtrip_model,
         rank,
         world_size,
         device,
@@ -414,6 +510,18 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if use_wandb:
+        wandb.run.summary.update({
+            "model_bytes": quant_file_bytes,
+            "code_bytes": code_bytes,
+            "total_submission_bytes": quant_file_bytes + code_bytes,
+            "final_val_loss": q_val_loss,
+            "final_val_bpb": q_val_bpb,
+            "total_steps": step,
+            "train_time_ms": training_time_ms,
+        })
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()

@@ -1,0 +1,53 @@
+# Sample experiment config for parameter_golf.
+# Only override what you need -- anything omitted falls back to the defaults
+# in common/hp.py.  Environment variables (UPPER_CASE) override both this file
+# and the defaults.
+#
+# Usage:
+#   torchrun --standalone --nproc_per_node=1 \
+#       -m parameter_golf.train.train --config parameter_golf/train/sample_config.yaml
+
+# --- Run identity ---
+run_id: sample_run
+seed: 42
+
+# --- Data ---
+data_path: ./data/datasets/fineweb10B_sp1024
+tokenizer_path: ./data/tokenizers/fineweb_1024_bpe.model
+vocab_size: 1024
+
+# --- Model shape ---
+num_layers: 9
+model_dim: 512
+num_heads: 8
+num_kv_heads: 4
+mlp_mult: 4
+tie_embeddings: true
+logit_softcap: 30.0
+
+# BitLinear (1.58-bit QAT) configuration.
+# use_bitlinear: master switch, must be true for any bitlinear to take effect.
+# bitlinear_layers: list of block indices to apply bitlinear to (null = all layers).
+# attention_bitlinear / mlp_bitlinear: which components within selected layers.
+use_bitlinear: true
+bitlinear_layers: [0, 1, 2]
+attention_bitlinear: true
+mlp_bitlinear: true
+
+# --- Training schedule ---
+iterations: 20000
+warmup_steps: 20
+warmdown_iters: 600
+train_batch_tokens: 524288
+train_seq_len: 1024
+max_wallclock_seconds: 600
+
+# --- Logging / validation ---
+val_loss_every: 1000
+val_batch_size: 524288
+train_log_every: 200
+
+# --- Optimizer ---
+matrix_lr: 0.12
+scalar_lr: 0.04
+muon_momentum: 0.95
