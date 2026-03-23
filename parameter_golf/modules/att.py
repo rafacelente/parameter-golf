@@ -5,6 +5,7 @@ from .rotary import Rotary, apply_rotary_emb
 from .linear import CastedLinear
 from .bitlinear import BitLinear
 import torch.nn.functional as F
+from ..kernels.p_softmax_attention import triton_p_softmax_attention
 
 
 def _make_linear(dim_in: int, dim_out: int, use_bitlinear: bool) -> nn.Linear:
@@ -20,6 +21,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_bitlinear: bool = False,
+        use_p_softmax_attention: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -32,6 +34,7 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         self.use_bitlinear = use_bitlinear
+        self.use_p_softmax_attention = use_p_softmax_attention
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = _make_linear(dim, dim, use_bitlinear)
         self.c_k = _make_linear(dim, kv_dim, use_bitlinear)
@@ -58,7 +61,10 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
+        if self.use_p_softmax_attention:
+            y = triton_p_softmax_attention(q, k, v, p=2.0)
+        else:
+            y = F.scaled_dot_product_attention(
             q,
             k,
             v,

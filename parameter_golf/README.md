@@ -14,14 +14,24 @@ parameter_golf/
 │                           #   validation token loading, SentencePiece BPB LUTs
 ├── eval/
 │   └── eval.py            # eval_val: validation loss + tokenizer-agnostic BPB
-├── model.py               # GPT: U-Net skip transformer with GQA
+├── kernels/
+│   ├── m2rnn/             # M2RNN Triton kernels
+│   │   ├── forward.py     # Triton forward kernel (autotuned, varlen support)
+│   │   ├── backward.py    # Triton backward kernel (gradient clipping, atomic GQA grads)
+│   │   ├── m2rnn.py       # Autograd Function + functional m2rnn() API
+│   │   └── utils.py       # Head count resolution (_get_num_heads)
+│   ├── p_softmax_attention.py  # p-softmax Triton attention kernel
+│   ├── triton_utils.py    # Shared Triton helpers (matmul, tanh, sigmoid, etc.)
+│   └── utils.py           # ceil_divide, divide_if_divisible, power-of-2 utilities
+├── model.py               # GPT: U-Net skip transformer with hybrid block support
 ├── modules/
-│   ├── att.py             # CausalSelfAttention (GQA + QK-norm + RoPE)
+│   ├── att.py             # CausalSelfAttention (GQA + QK-norm + RoPE + p-softmax)
 │   ├── bitlinear.py       # BitLinear layer (1.58-bit QAT with STE)
-│   ├── block.py           # Block (attention + MLP with residual mixing)
+│   ├── block.py           # BlockType enum, AttentionBlock, M2RNNBlock, make_block factory
 │   ├── ff.py              # MLP (relu^2)
-│   ├── layer_norm.py      # RMSNorm
+│   ├── layer_norm.py      # RMSNorm (parameter-free, fp32 cast)
 │   ├── linear.py          # CastedLinear (fp32 weights, bf16 compute)
+│   ├── m2rnn.py           # M2RNN nn.Module (conv1d + SiLU + recurrence + output gate)
 │   ├── rotary.py          # Rotary embeddings + apply_rotary_emb
 │   └── utils.py           # restore_low_dim_params_to_fp32
 ├── optimizers/
@@ -103,6 +113,118 @@ Multi-GPU (e.g. 8x H100):
 torchrun --standalone --nproc_per_node=8 -m parameter_golf.train.train \
     --config parameter_golf/train/sample_config.yaml
 ```
+
+## Hybrid blocks (Attention / M2RNN)
+
+Each block in the model can be either an **AttentionBlock** or an **M2RNNBlock**, controlled per-layer via the `m2rnn_layers` config field. Layers not listed use standard attention. This enables hybrid architectures that mix attention and recurrence at different depths.
+
+### AttentionBlock
+
+The default block type. Each block contains:
+
+- RMSNorm -> CausalSelfAttention (GQA + QK-norm + RoPE) -> residual scale
+- RMSNorm -> MLP (relu^2) -> residual scale
+- Learnable residual mixing with the initial embedding (`x0`)
+
+### M2RNNBlock
+
+Replaces the attention sub-layer with an M2RNN layer (Matrix-to-Matrix RNN). The M2RNN layer implements the full architecture from the paper (https://arxiv.org/pdf/2603.14360):
+
+1. **Linear projections** for q/k/v (fused), forget gate (f), and output gate (g)
+2. **Depthwise causal conv1d** (kernel_size=4) on q, k, v followed by **SiLU** activation
+3. **Sigmoid** on the forget gate
+4. **SiLU** on the output gate
+5. **M2RNN recurrence** (Triton-accelerated): `Z = tanh(H W + k v^T)`, `H = f H + (1-f) Z`
+6. **Output**: `y = H^T q + w_r * v` (learnable residual from value)
+7. **Output gating + RMSNorm**: `RMSNorm(y * g)`
+8. **Output projection**
+
+The MLP sub-layer is shared with AttentionBlock.
+
+### Configuration
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `m2rnn_layers` | `list[int]` or `null` | `null` | Block indices that use M2RNN instead of attention. `null` = all attention |
+| `m2rnn_num_forget_input_heads` | `int` or `null` | `null` | Number of forget gate heads. `null` = `num_kv_heads` |
+| `m2rnn_num_weight_heads` | `int` or `null` | `null` | Number of state transition weight heads. `null` = `num_kv_heads` |
+| `m2rnn_gradient_clipping` | `float` or `null` | `null` | Clip hidden-state gradients in the backward pass. `null` = no clipping |
+
+### Examples
+
+Replace all layers with M2RNN (pure RNN model):
+
+```yaml
+num_layers: 9
+m2rnn_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+```
+
+Hybrid: attention for first/last layers, M2RNN in the middle:
+
+```yaml
+num_layers: 9
+m2rnn_layers: [1, 2, 3, 5, 6, 7]
+```
+
+M2RNN with gradient clipping:
+
+```yaml
+m2rnn_layers: [1, 2, 3, 5, 6, 7]
+m2rnn_gradient_clipping: 1.0
+```
+
+## p-softmax attention
+
+Replaces the standard softmax in attention with a p-softmax variant (p=2) implemented as a Triton kernel. This changes the normalization from `exp(x) / sum(exp(x))` to `exp(x) / sum(exp(p*x))^(1/p)`, which can sharpen or flatten the attention distribution.
+
+### Configuration
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `use_p_softmax_attention` | `bool` | `false` | Enable p-softmax attention (p=2) for all attention layers |
+
+```yaml
+use_p_softmax_attention: true
+```
+
+When enabled, all `AttentionBlock` layers use the Triton p-softmax kernel instead of PyTorch's `scaled_dot_product_attention`. M2RNNBlock layers are unaffected since they don't use softmax attention.
+
+## Weight tying across layers
+
+Layers can share weights to reduce parameter count while maintaining depth. Tied layers use the exact same `nn.Module` instance, so gradients accumulate across all positions where the shared block appears.
+
+### Configuration
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `tied_weights` | `list[list[int]]` or `null` | `null` | Groups of layer indices that share weights. `null` = no tying |
+
+Each inner list defines a group of layers that share the same block. The block is constructed using the configuration of the lowest index in each group (the "canonical" layer). Layers not mentioned in any group get their own independent weights.
+
+### Examples
+
+Tie layers into groups of 3 (12 layers, 4 distinct blocks):
+
+```yaml
+num_layers: 12
+tied_weights: [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
+```
+
+Tie only the first half (9 layers, 6 distinct blocks):
+
+```yaml
+tied_weights: [[0, 1, 2]]
+```
+
+Combine with M2RNN for a hybrid tied model:
+
+```yaml
+num_layers: 12
+m2rnn_layers: [0, 1, 2, 3, 4, 5]
+tied_weights: [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
+```
+
+This creates 4 distinct blocks: 2 M2RNN (for layers 0-2 and 3-5) and 2 attention (for layers 6-8 and 9-11), each reused 3 times for a total of 12 effective layers.
 
 ## BitLinear (1.58-bit quantization-aware training)
 

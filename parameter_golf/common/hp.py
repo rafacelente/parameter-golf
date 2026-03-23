@@ -49,6 +49,16 @@ class Hyperparameters(BaseModel):
     bitlinear_layers: list[int] | None = Field(default=None)
     attention_bitlinear: bool = Field(default=True)
     mlp_bitlinear: bool = Field(default=True)
+    use_p_softmax_attention: bool = Field(default=False)
+
+    # Weight tying across layers.
+    tied_weights: list[list[int]] | None = Field(default=None)
+
+    # M2RNN options.
+    m2rnn_layers: list[int] | None = Field(default=None)
+    m2rnn_num_forget_input_heads: int | None = Field(default=None)
+    m2rnn_num_weight_heads: int | None = Field(default=None)
+    m2rnn_gradient_clipping: float | None = Field(default=None)
 
     # Optimizer hyperparameters.
     embed_lr: float = Field(default=0.6)

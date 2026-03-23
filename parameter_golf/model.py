@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from .modules.block import Block
+from .modules.block import BlockType, make_block, M2RNNBlock
 from .modules.layer_norm import RMSNorm
 from .modules.linear import CastedLinear
 import torch.nn.functional as F
@@ -22,6 +22,12 @@ class GPT(nn.Module):
         qk_gain_init: float,
         attn_bitlinear_layers: set[int] | None = None,
         mlp_bitlinear_layers: set[int] | None = None,
+        use_p_softmax_attention: bool = False,
+        m2rnn_layers: set[int] | None = None,
+        m2rnn_num_forget_input_heads: int | None = None,
+        m2rnn_num_weight_heads: int | None = None,
+        m2rnn_gradient_clipping: float | None = None,
+        tied_weights: list[set[int]] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -34,23 +40,41 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.use_p_softmax_attention = use_p_softmax_attention
         _attn_bl = attn_bitlinear_layers or set()
         _mlp_bl = mlp_bitlinear_layers or set()
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                    attn_bitlinear=(i in _attn_bl),
-                    mlp_bitlinear=(i in _mlp_bl),
+        _m2rnn = m2rnn_layers or set()
+
+        # Build a mapping from layer index -> canonical index for weight tying.
+        # Layers sharing a tied group all point to the lowest index in that group.
+        _tie_map: dict[int, int] = {}
+        for group in (tied_weights or []):
+            canonical = min(group)
+            for idx in group:
+                _tie_map[idx] = canonical
+
+        built_blocks: dict[int, nn.Module] = {}
+        block_list: list[nn.Module] = []
+        for i in range(num_layers):
+            canonical = _tie_map.get(i, i)
+            if canonical not in built_blocks:
+                built_blocks[canonical] = make_block(
+                    block_type=BlockType.M2RNN if canonical in _m2rnn else BlockType.ATTENTION,
+                    dim=model_dim,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    mlp_mult=mlp_mult,
+                    rope_base=rope_base,
+                    qk_gain_init=qk_gain_init,
+                    attn_bitlinear=(canonical in _attn_bl),
+                    mlp_bitlinear=(canonical in _mlp_bl),
+                    use_p_softmax_attention=self.use_p_softmax_attention,
+                    num_forget_input_heads=m2rnn_num_forget_input_heads,
+                    num_weight_heads=m2rnn_num_weight_heads,
+                    m2rnn_gradient_clipping=m2rnn_gradient_clipping,
                 )
-                for i in range(num_layers)
-            ]
-        )
+            block_list.append(built_blocks[canonical])
+        self.blocks = nn.ModuleList(block_list)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -63,6 +87,9 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        for block in self.blocks:
+            if isinstance(block, M2RNNBlock):
+                block.m2rnn.reset_parameters()
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)

@@ -8,7 +8,7 @@
 #       -m parameter_golf.train.train --config parameter_golf/train/sample_config.yaml
 
 # --- Run identity ---
-run_id: sample_run
+run_id: m2rnn_1
 seed: 42
 
 # --- Data ---
@@ -21,26 +21,36 @@ num_layers: 9
 model_dim: 512
 num_heads: 8
 num_kv_heads: 4
-mlp_mult: 4
+mlp_mult: 2
 tie_embeddings: true
 logit_softcap: 30.0
+
+# p-softmax attention
+use_p_softmax_attention: false
+
+# tied weights
+# tied_weights: [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
+
+# m2rnn configuration
+m2rnn_layers: [1, 2, 3]
+
 
 # BitLinear (1.58-bit QAT) configuration.
 # use_bitlinear: master switch, must be true for any bitlinear to take effect.
 # bitlinear_layers: list of block indices to apply bitlinear to (null = all layers).
 # attention_bitlinear / mlp_bitlinear: which components within selected layers.
-use_bitlinear: true
+use_bitlinear: false
 bitlinear_layers: [0, 1, 2]
 attention_bitlinear: true
 mlp_bitlinear: true
 
 # --- Training schedule ---
-iterations: 20000
+iterations: 2500
 warmup_steps: 20
-warmdown_iters: 600
+warmdown_iters: 1200
 train_batch_tokens: 524288
 train_seq_len: 1024
-max_wallclock_seconds: 600
+max_wallclock_seconds: 0
 
 # --- Logging / validation ---
 val_loss_every: 1000
@@ -48,6 +58,6 @@ val_batch_size: 524288
 train_log_every: 200
 
 # --- Optimizer ---
-matrix_lr: 0.12
-scalar_lr: 0.04
+matrix_lr: 0.004
+scalar_lr: 0.002
 muon_momentum: 0.95

@@ -155,6 +155,9 @@ def main() -> None:
     mlp_bl_layers = bl_layer_set if args.use_bitlinear and args.mlp_bitlinear else None
     any_bitlinear = attn_bl_layers is not None or mlp_bl_layers is not None
 
+    m2rnn_layer_set = set(args.m2rnn_layers) if args.m2rnn_layers is not None else None
+    tied_weight_groups = [set(g) for g in args.tied_weights] if args.tied_weights is not None else None
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -169,12 +172,19 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         attn_bitlinear_layers=attn_bl_layers,
         mlp_bitlinear_layers=mlp_bl_layers,
+        use_p_softmax_attention=args.use_p_softmax_attention,
+        m2rnn_layers=m2rnn_layer_set,
+        m2rnn_num_forget_input_heads=args.m2rnn_num_forget_input_heads,
+        m2rnn_num_weight_heads=args.m2rnn_num_weight_heads,
+        m2rnn_gradient_clipping=args.m2rnn_gradient_clipping,
+        tied_weights=tied_weight_groups,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, BitLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # m2rnn has some compatibility issues with torch.compile, cba fixing it so we skip it
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if len(m2rnn_layer_set) > 0 else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -188,10 +198,14 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_param_names = [name for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+    scalar_param_names = [name for name, p in block_named_params if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+    print(f"matrix_param_names: {matrix_param_names}")
+    print(f"scalar_param_names: {scalar_param_names}")
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -231,6 +245,7 @@ def main() -> None:
     if any_bitlinear:
         log0(f"bitlinear: attn_layers={sorted(attn_bl_layers) if attn_bl_layers else []} mlp_layers={sorted(mlp_bl_layers) if mlp_bl_layers else []}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"use_p_softmax_attention:{args.use_p_softmax_attention}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
